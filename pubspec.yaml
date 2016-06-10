@@ -3,3 +3,5 @@ description: Sends files prefixed with their size over the network.
 version: 1.0.0
 homepage: https://github.com/ds84182/sockfile.dart
 author: Dwayne Slater <ds84182@gmail.com>
+executables:
+  sockfile:
