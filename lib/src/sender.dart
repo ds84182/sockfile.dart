@@ -9,7 +9,73 @@ class SendResult {
     String toString() => "SendResult: $successful $failures";
 }
 
-Future<SendResult> send(String ipAddr, List<String> fileNames, {bool verbose: false}) async {
+class StreamPair {
+    final StreamSink<List<int>> send;
+    final Stream<List<int>> recv;
+    final Function onClose;
+
+    StreamPair(this.send, this.recv, {this.onClose});
+
+    Future close() {
+        if (onClose != null) return onClose();
+        return send.close();
+    }
+}
+
+typedef Future<StreamPair> StreamOpener(Uri uri);
+
+StreamOpener _byWebsock = (uri) async {
+    var ws = await WebSocket.connect(uri.toString());
+
+    // ignore: argument_type_not_assignable
+    return new StreamPair(ws, ws);
+};
+
+final Map<String, StreamOpener> _streamOpeners = {
+    "tcp": (uri) async {
+        var hostname = uri.host;
+        var port = 5000;
+        var colon = hostname.indexOf(':');
+        if (colon >= 0) {
+            port = int.parse(hostname.substring(colon+1));
+            hostname = hostname.substring(0, colon);
+        }
+
+        var socket = await Socket.connect(hostname, port);
+
+        return new StreamPair(socket, socket, onClose: () async {
+            // Flush the socket to make sure that the data was sent completely
+            await socket.flush();
+            // Destroy the socket
+            socket.destroy();
+        });
+    },
+    "ws": _byWebsock,
+    "wss": _byWebsock,
+    "file": (uri) async {
+        var notRealFile = new File.fromUri(uri);
+        var inputFile = new File(notRealFile.path+"_input");
+        var outputFile = new File(notRealFile.path+"_output");
+
+        var read = inputFile.openRead();
+        var write = outputFile.openWrite();
+
+        return new StreamPair(write, read, onClose: () {
+            return write.close();
+        });
+    }
+};
+
+Future<StreamPair> openStream(Uri uri) {
+    var proto = uri.scheme ?? "tcp";
+    var opener = _streamOpeners[proto];
+    if (opener == null)
+        throw new FormatException(
+            "Invalid protocol $proto, expected one of: ${_streamOpeners.keys.join(", ")}");
+    return opener(uri);
+}
+
+Future<SendResult> send(StreamPair pair, List<String> fileNames, {bool verbose: false}) async {
     // This method converts any integer of any width to the byte equivalent
     // Dart automatically switches over to BigInt when you overflow the platform's maximum int
     List<int> toBytes(int i, int width) =>
@@ -19,14 +85,20 @@ Future<SendResult> send(String ipAddr, List<String> fileNames, {bool verbose: fa
         if (verbose) print(msg);
     }
 
-    // Super ultra convenient method that opens a socket asynchronously
-    var socket = await Socket.connect(ipAddr, 5000);
-    // Sockets extend Stream<List<int>> and Sink<List<int>>. We want to be able to access a single byte (for file ack)
-    // This is done by expanding the list and converting the stream into a broadcast stream
-    var byteStream = socket.expand((byteList) => byteList).asBroadcastStream();
+    var sendStream = pair.send;
+    // Since we want to read induvidual bytes we iterate over a stream where we
+    // expand all our byte lists to bytes
+    // This could be made faster by some custom code, but how fast would we
+    // really need this to be?
+    var byteStreamIterator = new StreamIterator(pair.recv.expand((byteList) => byteList));
+
+    Future<int> nextByte() async {
+        await byteStreamIterator.moveNext();
+        return byteStreamIterator.current;
+    }
 
     // Write the number of files to the socket
-    socket.add(toBytes(fileNames.length, 4));
+    sendStream.add(toBytes(fileNames.length, 4));
 
     vprint("Sending files...");
 
@@ -45,7 +117,7 @@ Future<SendResult> send(String ipAddr, List<String> fileNames, {bool verbose: fa
         }
 
         // Wait for the first available ack byte
-        var ack = await byteStream.first;
+        var ack = await nextByte();
         if (ack == 0) {
             vprint("Send canceled by remote.");
             failed = true;
@@ -56,19 +128,19 @@ Future<SendResult> send(String ipAddr, List<String> fileNames, {bool verbose: fa
 
         if (ack >= 2) {
             // Protocol Version Ack
-            socket.add([255, 255, 255, 255, 255, 255, 255, 255]);
+            sendStream.add([255, 255, 255, 255, 255, 255, 255, 255]);
 
             // Protocol Extension: File name
             var basename = file.uri.pathSegments.last;
-            socket.add(toBytes(basename.length, 4));
-            socket.add(UTF8.encode(basename));
+            sendStream.add(toBytes(basename.length, 4));
+            sendStream.add(UTF8.encode(basename));
         }
 
         var size = await file.length();
-        socket.add(toBytes(size, 8)); // Sends the file length as a uint64
+        sendStream.add(toBytes(size, 8)); // Sends the file length as a uint64
 
         vprint('Sending data for "$fileName"...');
-        await socket.addStream(file.openRead()); // Adds the data from the file to the stream and waits for it to finish
+        await sendStream.addStream(file.openRead()); // Adds the data from the file to the stream and waits for it to finish
 
         vprint('File "$fileName" sent successfully...');
 
@@ -86,10 +158,9 @@ Future<SendResult> send(String ipAddr, List<String> fileNames, {bool verbose: fa
         result = new SendResult(false, sentList ?? const []);
     }
 
-    // Flush the socket to make sure that the data was sent completely
-    await socket.flush();
-    // Destroy the socket
-    socket.destroy();
+    await byteStreamIterator.cancel();
+    await sendStream.close();
+    await pair.close();
 
     return result;
 }

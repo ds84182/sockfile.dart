@@ -12,7 +12,8 @@ Future<int> main(List<String> args) async {
         return exitInvalidArgs;
     }
 
-    var result = await sockfile.send(args[0], args.skip(1).toList(), verbose: true);
+    var pair = await sockfile.openStream(Uri.parse(args[0]));
+    var result = await sockfile.send(pair, args.skip(1).toList(), verbose: true);
 
     return result.successful ? exitSuccess : exitFailure;
 }
